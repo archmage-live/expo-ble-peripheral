@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "expo-ble-peripheral": ["../src/index"],
+      "expo-ble-peripheral/*": ["../src/*"]
+    }
+  }
+}

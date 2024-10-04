@@ -1,7 +1,7 @@
 package live.archmage.bleperipheral
 
 import android.Manifest
-import android.annotation.SuppressLint
+import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -10,9 +10,8 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattServer
 import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
-import android.bluetooth.BluetoothGattService.SERVICE_TYPE_PRIMARY
-import android.bluetooth.BluetoothGattService.SERVICE_TYPE_SECONDARY
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -22,20 +21,35 @@ import android.bluetooth.le.AdvertisingSetParameters
 import android.bluetooth.le.PeriodicAdvertisingParameters
 import android.bluetooth.le.TransportBlock
 import android.bluetooth.le.TransportDiscoveryData
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Bundle
 import android.os.ParcelUuid
+import android.util.LruCache
 import androidx.annotation.RequiresApi
-import expo.modules.interfaces.permissions.Permissions.askForPermissionsWithPermissionsManager
-import expo.modules.interfaces.permissions.Permissions.getPermissionsWithPermissionsManager
+import expo.modules.interfaces.permissions.Permissions
+import expo.modules.interfaces.permissions.PermissionsResponse
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.exception.CodedException
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import expo.modules.kotlin.types.Enumerable
+import java.io.ByteArrayOutputStream
 import java.util.UUID
+
+enum class BleState(val value: String) : Enumerable {
+  Unknown("Unknown"),
+  Resetting("Resetting"),
+  Unsupported("Unsupported"),
+  Unauthorized("Unauthorized"),
+  Off("Off"),
+  On("On"),
+}
 
 @JvmRecord
 data class AddCharacteristicArgs(
@@ -63,19 +77,18 @@ data class AdvertiseDataArgs(
 )
 
 @JvmRecord
+data class TransportDiscoveryDataArgs(
+  val transportDataType: Int = 0,
+  val transportBlocks: List<TransportBlockArgs> = ArrayList(),
+)
+
+@JvmRecord
 data class TransportBlockArgs(
   val orgId: Int = 0,
   val tdsFlags: Int = 0,
   val transportDataLength: Int = 0,
   val transportData: ByteArray? = null,
 )
-
-@JvmRecord
-data class TransportDiscoveryDataArgs(
-  val transportDataType: Int = 0,
-  val transportBlocks: List<TransportBlockArgs> = ArrayList<TransportBlockArgs>(),
-)
-
 
 @JvmRecord
 data class PeriodicAdvertisingParametersArgs(
@@ -122,11 +135,11 @@ data class StartArgs(
   val maxExtendedAdvertisingEvents: Int? = null,
 )
 
-class ExpoBlePeripheralModule : Module() {
-  private lateinit var context: Context
-  private val currentActivity
-    get() = appContext.activityProvider?.currentActivity ?: throw Exceptions.MissingActivity()
+const val STATE_CHANGED_EVENT_NAME = "onStateChanged"
+const val NOTIFICATION_READY_EVENT_NAME = "onNotificationReady"
+const val CHAR_WRITTEN_EVENT_NAME = "onCharacteristicWritten"
 
+class ExpoBlePeripheralModule : Module() {
   // Each module class must implement the definition function. The definition consists of components
   // that describes the module's functionality and behavior.
   // See https://docs.expo.dev/modules/module-api for more details about available components.
@@ -139,61 +152,119 @@ class ExpoBlePeripheralModule : Module() {
     // The module will be accessible from `requireNativeModule('ExpoBlePeripheral')` in JavaScript.
     Name("ExpoBlePeripheral")
 
-    // Sets constant properties on the module. Can take a dictionary or a closure that returns a dictionary.
-    Constants(
-      "PI" to Math.PI
+    // Defines event names that the module can send to JavaScript.
+    Events(
+      STATE_CHANGED_EVENT_NAME,
+      NOTIFICATION_READY_EVENT_NAME,
+      CHAR_WRITTEN_EVENT_NAME
     )
 
-    // Defines event names that the module can send to JavaScript.
-    Events("onChange")
-
-    // Defines a JavaScript synchronous function that runs the native code on the JavaScript thread.
-    Function("hello") {
-      "Hello world! 👋"
+    Property("name") {
+      name
     }
 
-    // Defines a JavaScript function that always returns a Promise and whose native code
-    // is by default dispatched on the different thread than the JavaScript runtime runs on.
-    AsyncFunction("setValueAsync") { value: String ->
-      // Send an event to JavaScript.
-      sendEvent(
-        "onChange", mapOf(
-          "value" to value
-        )
-      )
+    Function("setName") { name: String ->
+      this@ExpoBlePeripheralModule.name = name
     }
 
-    Function("isSupported") {
-      context.packageManager!!.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)
+    Function("hasPermission") {
+      hasPermission()
     }
 
-    Function("isAdvertising") {
-      advertising
-    }
-
-    Function("addService") { uuid: String ->
-      val service = BluetoothGattService(UUID.fromString(uuid), SERVICE_TYPE_PRIMARY)
-      servicesMap.put(uuid, service)
-    }
-
-    Function("addSecondaryService") { uuid: String, parentUuid: String ->
-      val parentService = servicesMap.get(parentUuid)
-      requireNotNull(parentService) { "Parent service not found" }
-      val service = BluetoothGattService(UUID.fromString(uuid), SERVICE_TYPE_SECONDARY)
-      parentService.addService(service)
-      parentService
-    }
-
-    Function("addCharacteristic") { args: AddCharacteristicArgs, serviceUuid: String, parentServiceUuid: String? ->
-      val service = if (parentServiceUuid == null) {
-        servicesMap.get(serviceUuid)
+    AsyncFunction("requestPermission") { promise: Promise ->
+      if (hasPermission()) {
+        promise.resolve(true)
       } else {
-        servicesMap.get(parentServiceUuid)?.includedServices!!.find {
-          it.uuid == UUID.fromString(
-            serviceUuid
+        requestPermission(promise)
+      }
+    }
+
+    AsyncFunction("enable") { promise: Promise ->
+      if (bluetoothManager.adapter.isEnabled) {
+        promise.resolve(true)
+      } else {
+        enablePromise = promise
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+          @Suppress("MissingPermission")
+          if (!bluetoothManager.adapter.enable()) {
+            enablePromise = null
+            promise.resolve(bluetoothManager.adapter.isEnabled)
+          }
+        } else {
+          @Suppress("MissingPermission")
+          currentActivity.startActivityForResult(
+            Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
+            0,
           )
         }
       }
+    }
+
+    Property("state") {
+      state
+    }
+
+    Function("isAdvertising") {
+      isAdvertising
+    }
+
+    Function("getServices") {
+      servicesMap.values.map { service ->
+        mapOf(
+          "uuid" to service.uuid.toString(),
+          "isPrimary" to (service.type == BluetoothGattService.SERVICE_TYPE_PRIMARY),
+          "characteristics" to service.characteristics.map { char ->
+            mapOf(
+              "uuid" to char.uuid.toString(),
+              "properties" to char.properties,
+              "permissions" to char.permissions,
+              "value" to char.value,
+              "descriptors" to char.descriptors.map { descriptor ->
+                mapOf(
+                  "uuid" to descriptor.uuid.toString(),
+                  "permissions" to descriptor.permissions,
+                  "value" to descriptor.value,
+                )
+              },
+            )
+          },
+        )
+      }
+    }
+
+    Function("addService") { uuid: String, primary: Boolean ->
+      if (servicesMap.contains(uuid)) {
+        throw CodedException("Service already added")
+      }
+
+      val service = BluetoothGattService(
+        UUID.fromString(uuid),
+        if (primary) BluetoothGattService.SERVICE_TYPE_PRIMARY else BluetoothGattService.SERVICE_TYPE_SECONDARY
+      )
+      servicesMap.put(uuid, service)
+      @Suppress("MissingPermission")
+      gattServer?.addService(service)
+    }
+
+    Function("removeService") { uuid: String ->
+      val service = servicesMap.remove(uuid)
+      requireNotNull(service) { "Service not found" }
+      @Suppress("MissingPermission")
+      gattServer?.removeService(service)
+    }
+
+    Function("removeAllServices") {
+      servicesMap.clear()
+      @Suppress("MissingPermission")
+      gattServer?.clearServices()
+    }
+
+    Function("getCharacteristics") { serviceUuid: String? ->
+    }
+
+    Function("addCharacteristic") { args: AddCharacteristicArgs, serviceUuid: String ->
+      val service = servicesMap.get(serviceUuid)
       requireNotNull(service) { "Service not found" }
 
       val characteristic =
@@ -204,37 +275,13 @@ class ExpoBlePeripheralModule : Module() {
       service.addCharacteristic(characteristic)
     }
 
-    Function("updateCharacteristic") { args: UpdateCharacteristicArgs, serviceUuid: String, parentServiceUuid: String? ->
-      val service = if (parentServiceUuid == null) {
-        servicesMap.get(serviceUuid)
-      } else {
-        servicesMap.get(parentServiceUuid)?.includedServices!!.find {
-          it.uuid == UUID.fromString(
-            serviceUuid
-          )
-        }
-      }
+    Function("updateCharacteristic") { args: UpdateCharacteristicArgs, serviceUuid: String ->
+      val service = servicesMap.get(serviceUuid)
       requireNotNull(service) { "Service not found" }
 
       val characteristic = service.characteristics.find { it.uuid == UUID.fromString(args.uuid) }
       requireNotNull(characteristic) { "Characteristic not found" }
       characteristic.setValue(args.value)
-    }
-
-    Function("notifyCharacteristicChanged") { uuid: String, serviceUuid: String, parentServiceUuid: String? ->
-      val service = if (parentServiceUuid == null) {
-        servicesMap.get(serviceUuid)
-      } else {
-        servicesMap.get(parentServiceUuid)?.includedServices!!.find {
-          it.uuid == UUID.fromString(
-            serviceUuid
-          )
-        }
-      }
-      requireNotNull(service) { "Service not found" }
-
-      val characteristic = service.characteristics.find { it.uuid == UUID.fromString(uuid) }
-      requireNotNull(characteristic) { "Characteristic not found" }
 
       val indicate =
         ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) == BluetoothGattCharacteristic.PROPERTY_INDICATE)
@@ -244,20 +291,27 @@ class ExpoBlePeripheralModule : Module() {
       }
 
       for (device in devices) {
-        @Suppress("MissingPermission")
-        gattServer?.notifyCharacteristicChanged(
-          device, characteristic, indicate
-        )
+        @Suppress("MissingPermission", "NewApi")
+        val success = gattServer?.notifyCharacteristicChanged(
+          device, characteristic, indicate, args.value
+        ) == BluetoothStatusCodes.SUCCESS
+
+        if (!success) {
+          return@Function false
+        }
       }
+
+      return@Function true
     }
 
-    AsyncFunction("start") { name: String, args: StartArgs, promise: Promise ->
-      if (!appContext.permissions!!.hasGrantedPermissions(
-          Manifest.permission.BLUETOOTH_CONNECT,
-          Manifest.permission.BLUETOOTH_ADVERTISE,
-        )
-      ) {
-        promise.reject(Exceptions.MissingPermissions(Manifest.permission.BLUETOOTH_CONNECT))
+    AsyncFunction("start") { args: StartArgs, promise: Promise ->
+      if (state != BleState.On) {
+        promise.reject(CodedException("Peripheral is not powered on, but in state `$state`"))
+        return@AsyncFunction
+      }
+
+      if (isAdvertising) {
+        promise.reject(CodedException("Peripheral is currently advertising"))
         return@AsyncFunction
       }
 
@@ -365,12 +419,12 @@ class ExpoBlePeripheralModule : Module() {
             super.onAdvertisingSetStarted(advertisingSet, txPower, status)
             when (status) {
               ADVERTISE_SUCCESS -> {
-                advertising = true
+                isAdvertising = true
                 promise.resolve("startAdvertisingSet succeeded")
               }
 
               else -> {
-                advertising = false
+                isAdvertising = false
                 promise.reject(CodedException("startAdvertisingSet failed: $status"))
               }
             }
@@ -386,12 +440,12 @@ class ExpoBlePeripheralModule : Module() {
             super.onAdvertisingEnabled(advertisingSet, enable, status)
             when (status) {
               ADVERTISE_SUCCESS -> {
-                advertising = true
+                isAdvertising = true
                 promise.resolve("startAdvertisingSet succeeded")
               }
 
               else -> {
-                advertising = false
+                isAdvertising = false
                 promise.reject(CodedException("startAdvertisingSet failed: $status"))
               }
             }
@@ -435,14 +489,14 @@ class ExpoBlePeripheralModule : Module() {
         advertisingCallback = object : AdvertiseCallback() {
           override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             super.onStartSuccess(settingsInEffect)
-            advertising = true
+            isAdvertising = true
             promise.resolve("startAdvertising succeeded")
 
           }
 
           override fun onStartFailure(errorCode: Int) {
             super.onStartFailure(errorCode)
-            advertising = false
+            isAdvertising = false
             promise.reject(CodedException("startAdvertising failed: $errorCode"))
           }
         }
@@ -472,20 +526,100 @@ class ExpoBlePeripheralModule : Module() {
         advertiser.stopAdvertisingSet(advertisingSetCallback)
         advertisingSetCallback = null
       }
-      advertising = false
+      isAdvertising = false
+
+      devices.clear()
 
       promise.resolve()
     }
+
+    OnCreate {
+      state = getState()
+
+      val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+
+      @Suppress("NewApi")
+      context.registerReceiver(broadcastReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    }
+
+    OnDestroy {
+      context.unregisterReceiver(broadcastReceiver)
+    }
+
+    OnActivityResult { activity, onActivityResultPayload ->
+      if (onActivityResultPayload.requestCode == 0) {
+        if (onActivityResultPayload.resultCode == Activity.RESULT_OK) {
+          enablePromise?.resolve(bluetoothManager.adapter.isEnabled)
+        } else {
+          enablePromise?.resolve(false)
+        }
+
+        if (enablePromise != null) {
+          enablePromise = null
+        }
+      }
+    }
   }
 
+  private val currentActivity
+    get() = appContext.activityProvider?.currentActivity ?: throw Exceptions.MissingActivity()
+
+  private lateinit var context: Context
+
   private lateinit var bluetoothManager: BluetoothManager
-  private var advertising = false
+
+  private var name: String = "BlePeripheral"
+  private var servicesMap = HashMap<String, BluetoothGattService>()
+
+  private var state: BleState = BleState.Unknown
+
+  private var gattServer: BluetoothGattServer? = null
+
+  private var isAdvertising = false
   private var advertisingCallback: AdvertiseCallback? = null
   private var advertisingSetCallback: AdvertisingSetCallback? = null
 
-  private var gattServer: BluetoothGattServer? = null
-  private var servicesMap = HashMap<String, BluetoothGattService>()
   private var devices = HashSet<BluetoothDevice>()
+
+  private var enablePromise: Promise? = null
+
+  private val broadcastReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+      val newState = getState()
+      if (state != newState) {
+        state = newState
+        sendEvent(
+          STATE_CHANGED_EVENT_NAME, mapOf(
+            "state" to state
+          )
+        )
+      }
+
+      enablePromise?.resolve(bluetoothManager.adapter.isEnabled)
+      if (enablePromise != null) {
+        enablePromise = null
+      }
+    }
+  }
+
+  private fun getState(): BleState {
+    if (!context.packageManager!!.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
+      return BleState.Unsupported
+    }
+    if (bluetoothManager.adapter == null) {
+      return BleState.Unsupported
+    }
+    if (!hasPermission()) {
+      return BleState.Unauthorized
+    }
+    when (bluetoothManager.adapter.state) {
+      BluetoothAdapter.STATE_OFF -> return BleState.Off
+      BluetoothAdapter.STATE_ON -> return BleState.On
+      BluetoothAdapter.STATE_TURNING_OFF -> return BleState.Resetting
+      BluetoothAdapter.STATE_TURNING_ON -> return BleState.Resetting
+    }
+    return BleState.Unknown
+  }
 
   private val gattServerCallback = object : BluetoothGattServerCallback() {
     override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
@@ -536,17 +670,36 @@ class ExpoBlePeripheralModule : Module() {
         device, requestId, characteristic, preparedWrite, responseNeeded, offset, value
       )
 
-      val len = offset + value.size
-      val value = if (len > characteristic.value.size) {
-        null
+      val status = if (preparedWrite) {
+        val pair = preparedCharacteristicWrites.get(requestId) ?: Pair(
+          characteristic,
+          ByteArrayOutputStream(value.size)
+        )
+        val char = pair.first
+        val buffer = pair.second
+        if (characteristic.uuid == char.uuid && offset == buffer.size()) {
+          @Suppress("NewApi")
+          buffer.writeBytes(value)
+          preparedCharacteristicWrites.put(requestId, pair)
+          BluetoothGatt.GATT_SUCCESS
+        } else {
+          BluetoothGatt.GATT_INVALID_OFFSET
+        }
       } else {
-        characteristic.setValue(value.copyInto(characteristic.value.copyOf(), offset))
-        value
+        if (offset <= characteristic.value.size) {
+          characteristic.setValue(
+            characteristic.value.sliceArray(0 until offset) + value
+          )
+          BluetoothGatt.GATT_SUCCESS
+        } else {
+          BluetoothGatt.GATT_INVALID_OFFSET
+        }
       }
+
       if (responseNeeded) {
         @Suppress("MissingPermission")
         gattServer?.sendResponse(
-          device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+          device, requestId, status, offset, value
         );
       }
     }
@@ -579,104 +732,118 @@ class ExpoBlePeripheralModule : Module() {
         device, requestId, descriptor, preparedWrite, responseNeeded, offset, value
       )
 
-      val len = offset + value.size
-      val value = if (len > descriptor.value.size) {
-        null
+      val status = if (preparedWrite) {
+        val pair = preparedDescriptorWrites.get(requestId) ?: Pair(
+          descriptor,
+          ByteArrayOutputStream(value.size)
+        )
+        val desc = pair.first
+        val buffer = pair.second
+        if (descriptor.uuid == desc.uuid && offset == buffer.size()) {
+          @Suppress("NewApi")
+          buffer.writeBytes(value)
+          preparedDescriptorWrites.put(requestId, pair)
+          BluetoothGatt.GATT_SUCCESS
+        } else {
+          BluetoothGatt.GATT_INVALID_OFFSET
+        }
       } else {
-        descriptor.setValue(value.copyInto(descriptor.value.copyOf(), offset))
-        value
+        if (offset <= descriptor.value.size) {
+          descriptor.setValue(
+            descriptor.value.sliceArray(0 until offset) + value
+          )
+          BluetoothGatt.GATT_SUCCESS
+        } else {
+          BluetoothGatt.GATT_INVALID_OFFSET
+        }
       }
+
       if (responseNeeded) {
         @Suppress("MissingPermission")
         gattServer?.sendResponse(
-          device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+          device, requestId, status, offset, value
         );
       }
     }
-  }
 
-  fun checkAndEnableBluetooth(shouldAsk: Boolean): Boolean {
-    return if (bluetoothManager.adapter.isEnabled) {
-      true
-    } else {
-      val hasPermission = requestPermission(object : Promise {
-        override fun resolve(value: Any?) {
-        }
+    val preparedCharacteristicWrites =
+      LruCache<Int, Pair<BluetoothGattCharacteristic, ByteArrayOutputStream>>(16)
+    val preparedDescriptorWrites =
+      LruCache<Int, Pair<BluetoothGattDescriptor, ByteArrayOutputStream>>(16)
 
-        override fun reject(code: String, message: String?, cause: Throwable?) {
+    override fun onExecuteWrite(device: BluetoothDevice?, requestId: Int, execute: Boolean) {
+      super.onExecuteWrite(device, requestId, execute)
+
+      preparedCharacteristicWrites.get(requestId)?.let {
+        if (execute) {
+          val char = it.first
+          val buffer = it.second
+          char.setValue(buffer.toByteArray())
         }
-      })
-      if (hasPermission) {
-        enableBluetooth(shouldAsk)
+        preparedCharacteristicWrites.remove(requestId)
       }
-      false
+
+      preparedDescriptorWrites.get(requestId)?.let {
+        if (execute) {
+          val desc = it.first
+          val buffer = it.second
+          desc.setValue(buffer.toByteArray())
+        }
+        preparedDescriptorWrites.remove(requestId)
+      }
     }
   }
 
-  @SuppressLint("MissingPermission")
-  fun enableBluetooth(shouldAsk: Boolean) {
-    if (shouldAsk) {
-      currentActivity.startActivityForResult(
-        Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
-        0,
-      )
-    } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-      bluetoothManager.adapter.enable()
+  private fun hasPermission(): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      hasBluetoothAdvertisePermission(context) && hasBluetoothConnectPermission(context)
+    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+      hasLocationCoarsePermission(context) && hasLocationFinePermission(context)
+    } else {
+      hasLocationCoarsePermission(context)
     }
   }
 
-  fun requestPermission(promise: Promise): Boolean {
+  private fun requestPermission(promise: Promise) {
+    val promise = object : Promise {
+      override fun resolve(value: Any?) {
+        if (value !is Bundle) {
+          promise.reject(CodedException("askForPermissionsWithPermissionsManager returned unexpected result: $value"))
+          return
+        }
+        promise.resolve(value.getBoolean(PermissionsResponse.GRANTED_KEY))
+      }
+
+      override fun reject(code: String, message: String?, cause: Throwable?) {
+        promise.reject(code, message, cause)
+      }
+    }
+
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
       if (!hasBluetoothAdvertisePermission(context) || !hasBluetoothConnectPermission(context)) {
-        askForPermissionsWithPermissionsManager(
+        Permissions.askForPermissionsWithPermissionsManager(
           appContext.permissions,
           promise,
           Manifest.permission.BLUETOOTH_ADVERTISE,
           Manifest.permission.BLUETOOTH_CONNECT,
         )
-        return false
-      } else {
-        getPermissionsWithPermissionsManager(
-          appContext.permissions,
-          promise,
-          Manifest.permission.BLUETOOTH_ADVERTISE,
-          Manifest.permission.BLUETOOTH_CONNECT,
-        )
-        return true
       }
     } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
       if (!hasLocationCoarsePermission(context) || !hasLocationFinePermission(context)) {
-        askForPermissionsWithPermissionsManager(
+        Permissions.askForPermissionsWithPermissionsManager(
           appContext.permissions,
           promise,
           Manifest.permission.ACCESS_FINE_LOCATION,
           Manifest.permission.ACCESS_COARSE_LOCATION,
         )
-        return false
-      } else {
-        getPermissionsWithPermissionsManager(
-          appContext.permissions,
-          promise,
-          Manifest.permission.ACCESS_FINE_LOCATION,
-          Manifest.permission.ACCESS_COARSE_LOCATION,
-        )
-        return true
       }
     } else {
       if (!hasLocationCoarsePermission(context)) {
-        askForPermissionsWithPermissionsManager(
+        Permissions.askForPermissionsWithPermissionsManager(
           appContext.permissions,
           promise,
           Manifest.permission.ACCESS_COARSE_LOCATION,
         )
-        return false
-      } else {
-        getPermissionsWithPermissionsManager(
-          appContext.permissions,
-          promise,
-          Manifest.permission.ACCESS_COARSE_LOCATION,
-        )
-        return true
       }
     }
   }

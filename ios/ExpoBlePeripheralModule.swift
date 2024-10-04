@@ -3,11 +3,12 @@ import Foundation
 import CoreBluetooth
 
 enum BleState: String, Enumerable {
-  case unknown
-  case unsupported
-  case unauthorized
-  case off
-  case on
+  case Unknown
+  case Resetting
+  case Unsupported
+  case Unauthorized
+  case Off
+  case On
 }
 
 struct AddCharacteristicArgs: Record {
@@ -87,7 +88,7 @@ public class ExpoBlePeripheralModule: Module {
     )
 
     Property("name") {
-      return self.name
+      self.name
     }
 
     Function("setName") { (name: String) in
@@ -95,13 +96,32 @@ public class ExpoBlePeripheralModule: Module {
     }
 
     Property("state") {
-      return state
+      state
+    }
+
+    Property("isAdvertising") {
+      manager?.isAdvertising ?? false
     }
 
     Function("getServices") { () in
       var services = []
-      for (_, service) in servicesMap {
-        services.append(service)
+      for (uuid, service) in servicesMap {
+        services.append([
+          "uuid": uuid,
+          "isPrimary": service.isPrimary,
+          "characteristics": (service.characteristics ?? []).map({ (char: CBCharacteristic) in
+            let char = char as! CBMutableCharacteristic
+            var c = [
+              "uuid": char.uuid.uuidString,
+              "properties": char.properties.rawValue,
+              "permissions": char.permissions.rawValue
+            ]
+            if let value = char.value {
+              c["value"] = value
+            }
+            return c
+          })
+        ])
       }
       return services
     }
@@ -113,7 +133,7 @@ public class ExpoBlePeripheralModule: Module {
 
       let service = CBMutableService(type: CBUUID(string: uuid), primary: primary)
       servicesMap[uuid] = service
-      manager.add(service)
+      manager?.add(service)
     }
 
     Function("removeService") { (uuid: String) in
@@ -122,16 +142,30 @@ public class ExpoBlePeripheralModule: Module {
       }
 
       servicesMap.removeValue(forKey: uuid)
-      manager.remove(service)
+      manager?.remove(service)
     }
 
     Function("removeAllServices") { () in
       servicesMap.removeAll()
-      manager.removeAllServices()
+      manager?.removeAllServices()
     }
 
-    Function("getCharacteristics") { (serviceUuid: String) in
-      return try self.getCharacteristics(serviceUuid)
+    Function("getCharacteristics") { (serviceUuid: String?) in
+      if let serviceUuid {
+        guard let service = servicesMap[serviceUuid] else {
+          throw GenericException("Service not found")
+        }
+
+        return (service.characteristics ?? []).map({
+          formatCharacteristic($0 as! CBMutableCharacteristic)
+        })
+      } else {
+        return servicesMap.values.flatMap({
+          ($0.characteristics ?? []).map({
+            formatCharacteristic($0 as! CBMutableCharacteristic)
+          })
+        })
+      }
     }
 
     Function("addCharacteristic") { (args: AddCharacteristicArgs, serviceUuid: String) in
@@ -163,28 +197,33 @@ public class ExpoBlePeripheralModule: Module {
       let characteristic = char as! CBMutableCharacteristic
       characteristic.value = args.value
 
-      return manager.updateValue(args.value, for: characteristic, onSubscribedCentrals: nil)
+      return manager?.updateValue(args.value, for: characteristic, onSubscribedCentrals: nil) ?? true
     }
 
-    AsyncFunction("start") { (promise: Promise) in
+    AsyncFunction("start") { (args: Dictionary<String, Any?>, promise: Promise) in
       if (managerDelegate.startPromise != nil) {
         promise.reject(GenericException("Starting in progress"))
         return
       }
 
-      if (manager.isAdvertising) {
-        promise.reject(GenericException("Peripheral is currently advertising data"))
+      if (state != BleState.On) {
+        promise.reject(WrongBleStateException(actual: state, expected: BleState.On))
         return
       }
 
-      if (state != BleState.on) {
-        promise.reject(WrongBleStateException(actual: state, expected: BleState.on))
+      manager = CBPeripheralManager(delegate: managerDelegate, queue: nil)
+      state = getState()
+
+      if (manager?.isAdvertising ?? false) {
+        promise.reject(GenericException("Peripheral is currently advertising"))
         return
       }
 
       var serviceUuids = [CBUUID]()
       for (_, service) in servicesMap {
         serviceUuids.append(service.uuid)
+
+        manager?.add(service)
       }
 
       let advertisementData = [
@@ -193,61 +232,46 @@ public class ExpoBlePeripheralModule: Module {
       ] as [String: Any]
 
       managerDelegate.startPromise = promise
-      manager.startAdvertising(advertisementData)
+      manager?.startAdvertising(advertisementData)
     }
 
     AsyncFunction("stop") { (promise: Promise) in
-      manager.stopAdvertising()
+      manager?.stopAdvertising()
+      manager = nil
       promise.resolve()
     }
 
     OnCreate {
       managerDelegate = PeripheralManagerDelegate(module: self)
-      manager = CBPeripheralManager(delegate: managerDelegate, queue: nil)
-      state = getState()
     }
   }
 
-  var manager: CBPeripheralManager!
+  var manager: CBPeripheralManager?
   var managerDelegate: PeripheralManagerDelegate!
-  
-  var state: BleState = BleState.unknown
-  
+
+  var state: BleState = BleState.Unknown
+
   var name: String = "BlePeripheral"
   var servicesMap = Dictionary<String, CBMutableService>()
-  
+
   func getState() -> BleState {
+    guard let manager else {
+      return BleState.Unknown
+    }
     switch (manager.state) {
     case CBManagerState.poweredOn:
-      return BleState.on
+      return BleState.On
     case CBManagerState.poweredOff:
-      return BleState.off
+      return BleState.Off
     case CBManagerState.unauthorized:
-      return BleState.unauthorized
+      return BleState.Unauthorized
     case CBManagerState.unsupported:
-      return BleState.unsupported
+      return BleState.Unsupported
+    case CBManagerState.resetting:
+      return BleState.Resetting
     default:
-      return BleState.unknown
+      return BleState.Unknown
     }
-  }
-
-  func getCharacteristics(_ serviceUuid: String) throws -> [[String: Any]] {
-    guard let service = servicesMap[serviceUuid] else {
-      throw GenericException("Service not found")
-    }
-
-    return (service.characteristics ?? []).map({ (char: CBCharacteristic) in
-      let char = char as! CBMutableCharacteristic
-      var c = [
-        "uuid": char.uuid.uuidString,
-        "properties": char.properties.rawValue,
-        "permissions": char.permissions.rawValue
-      ]
-      if let value = char.value {
-        c["value"] = value
-      }
-      return c
-    })
   }
 
   func getCharacteristic(_ uuid: String) -> CBMutableCharacteristic? {
@@ -260,6 +284,18 @@ public class ExpoBlePeripheralModule: Module {
     }
 
     return nil
+  }
+
+  func formatCharacteristic(_ char: CBMutableCharacteristic) -> [String: Any] {
+    var c = [
+      "uuid": char.uuid.uuidString,
+      "properties": char.properties.rawValue,
+      "permissions": char.permissions.rawValue
+    ] as [String : Any]
+    if let value = char.value {
+      c["value"] = value
+    }
+    return c
   }
 }
 
@@ -283,11 +319,11 @@ class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate {
   func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
     let services = dict[CBPeripheralManagerRestoredStateServicesKey] as! [CBMutableService]
     let advertisementData = dict[CBPeripheralManagerRestoredStateAdvertisementDataKey] as! [String: Any]
-    
+
     for service in services {
       module?.servicesMap[service.uuid.uuidString] = service
     }
-    
+
     module?.name = advertisementData[CBAdvertisementDataLocalNameKey] as! String
   }
 
@@ -321,26 +357,31 @@ class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate {
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
     guard let char = module?.getCharacteristic(request.characteristic.uuid.uuidString) else {
-      module?.manager.respond(to: request, withResult: .readNotPermitted)
+      module?.manager?.respond(to: request, withResult: .readNotPermitted)
+      return
+    }
+
+    if request.offset > char.value?.count ?? 0 {
+      module?.manager?.respond(to: request, withResult: .invalidOffset)
       return
     }
 
     request.value = char.value?[request.offset...]
-    module?.manager.respond(to: request, withResult: .success)
+    module?.manager?.respond(to: request, withResult: .success)
   }
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
     var chars = [(CBMutableCharacteristic, Data)]()
     for request in requests {
       guard let char = module?.getCharacteristic(request.characteristic.uuid.uuidString) else {
-        module?.manager.respond(to: request, withResult: .writeNotPermitted)
+        module?.manager?.respond(to: request, withResult: .writeNotPermitted)
         return
       }
 
       var value = char.value != nil ? Data(char.value!) : Data()
 
       if request.offset > value.count {
-        module?.manager.respond(to: request, withResult: .invalidOffset)
+        module?.manager?.respond(to: request, withResult: .invalidOffset)
         return
       }
 
@@ -361,7 +402,7 @@ class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate {
       ])
     }
 
-    module?.manager.respond(to: requests[0], withResult: .success)
+    module?.manager?.respond(to: requests[0], withResult: .success)
 
     module?.sendEvent(CHAR_WRITTEN_EVENT_NAME, [
       "characteristics": characteristics

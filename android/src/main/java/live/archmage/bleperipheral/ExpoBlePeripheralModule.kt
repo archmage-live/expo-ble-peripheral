@@ -205,7 +205,7 @@ class ExpoBlePeripheralModule : Module() {
       state
     }
 
-    Function("isAdvertising") {
+    Property("isAdvertising") {
       isAdvertising
     }
 
@@ -215,19 +215,7 @@ class ExpoBlePeripheralModule : Module() {
           "uuid" to service.uuid.toString(),
           "isPrimary" to (service.type == BluetoothGattService.SERVICE_TYPE_PRIMARY),
           "characteristics" to service.characteristics.map { char ->
-            mapOf(
-              "uuid" to char.uuid.toString(),
-              "properties" to char.properties,
-              "permissions" to char.permissions,
-              "value" to char.value,
-              "descriptors" to char.descriptors.map { descriptor ->
-                mapOf(
-                  "uuid" to descriptor.uuid.toString(),
-                  "permissions" to descriptor.permissions,
-                  "value" to descriptor.value,
-                )
-              },
-            )
+            formatCharacteristic(char)
           },
         )
       }
@@ -261,6 +249,18 @@ class ExpoBlePeripheralModule : Module() {
     }
 
     Function("getCharacteristics") { serviceUuid: String? ->
+      if (serviceUuid != null) {
+        val service = servicesMap.get(serviceUuid) ?: throw CodedException("Service not found")
+        service.characteristics.map { char ->
+          formatCharacteristic(char)
+        }
+      } else {
+        servicesMap.values.flatMap { service ->
+          service.characteristics.map { char ->
+            formatCharacteristic(char)
+          }
+        }
+      }
     }
 
     Function("addCharacteristic") { args: AddCharacteristicArgs, serviceUuid: String ->
@@ -304,14 +304,14 @@ class ExpoBlePeripheralModule : Module() {
       return@Function true
     }
 
-    AsyncFunction("start") { args: StartArgs, promise: Promise ->
+    AsyncFunction("start") { promise: Promise ->
       if (state != BleState.On) {
         promise.reject(CodedException("Peripheral is not powered on, but in state `$state`"))
         return@AsyncFunction
       }
 
-      if (isAdvertising) {
-        promise.reject(CodedException("Peripheral is currently advertising"))
+      if (gattServer != null) {
+        promise.reject(CodedException("Already started"))
         return@AsyncFunction
       }
 
@@ -321,8 +321,40 @@ class ExpoBlePeripheralModule : Module() {
       @Suppress("MissingPermission")
       gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
       for (service in servicesMap.values) {
+        if (gattServer!!.getService(service.uuid) != null) {
+          continue
+        }
         @Suppress("MissingPermission")
         gattServer!!.addService(service)
+      }
+
+      promise.resolve()
+    }
+
+    AsyncFunction("stop") { promise: Promise ->
+      if (isAdvertising) {
+        promise.reject(CodedException("stopAdvertising must be called before stopping"))
+        return@AsyncFunction
+      }
+
+      @Suppress("MissingPermission")
+      gattServer?.close()
+      gattServer = null
+
+      devices.clear()
+
+      promise.resolve()
+    }
+
+    AsyncFunction("startAdvertising") { args: StartArgs, promise: Promise ->
+      if (isAdvertising) {
+        promise.reject(CodedException("Peripheral is currently advertising"))
+        return@AsyncFunction
+      }
+
+      if (state != BleState.On) {
+        promise.reject(CodedException("Peripheral is not powered on, but in state `$state`"))
+        return@AsyncFunction
       }
 
       val advertiseDataBuilder = AdvertiseData.Builder()
@@ -511,24 +543,21 @@ class ExpoBlePeripheralModule : Module() {
       }
     }
 
-    @Suppress("MissingPermission")
-    AsyncFunction("stop") { promise: Promise ->
-      gattServer?.close()
-      gattServer = null
-
+    AsyncFunction("stopAdvertising") { promise: Promise ->
       if (advertisingCallback != null) {
         val advertiser = bluetoothManager.adapter.getBluetoothLeAdvertiser()
+        @Suppress("MissingPermission")
         advertiser.stopAdvertising(advertisingCallback)
         advertisingCallback = null
       }
       if (advertisingSetCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         val advertiser = bluetoothManager.adapter.getBluetoothLeAdvertiser()
+        @Suppress("MissingPermission")
         advertiser.stopAdvertisingSet(advertisingSetCallback)
         advertisingSetCallback = null
       }
-      isAdvertising = false
 
-      devices.clear()
+      isAdvertising = false
 
       promise.resolve()
     }
@@ -561,6 +590,22 @@ class ExpoBlePeripheralModule : Module() {
     }
   }
 
+  fun formatCharacteristic(characteristic: BluetoothGattCharacteristic): Map<String, Any> {
+    return mapOf(
+      "uuid" to characteristic.uuid.toString(),
+      "properties" to characteristic.properties,
+      "permissions" to characteristic.permissions,
+      "value" to characteristic.value,
+      "descriptors" to characteristic.descriptors.map { descriptor ->
+        mapOf(
+          "uuid" to descriptor.uuid.toString(),
+          "permissions" to descriptor.permissions,
+          "value" to descriptor.value,
+        )
+      },
+    )
+  }
+
   private val currentActivity
     get() = appContext.activityProvider?.currentActivity ?: throw Exceptions.MissingActivity()
 
@@ -575,11 +620,11 @@ class ExpoBlePeripheralModule : Module() {
 
   private var gattServer: BluetoothGattServer? = null
 
+  private var devices = HashSet<BluetoothDevice>()
+
   private var isAdvertising = false
   private var advertisingCallback: AdvertiseCallback? = null
   private var advertisingSetCallback: AdvertisingSetCallback? = null
-
-  private var devices = HashSet<BluetoothDevice>()
 
   private var enablePromise: Promise? = null
 
@@ -637,6 +682,8 @@ class ExpoBlePeripheralModule : Module() {
 
     override fun onNotificationSent(device: BluetoothDevice, status: Int) {
       super.onNotificationSent(device, status)
+
+      sendEvent(NOTIFICATION_READY_EVENT_NAME)
     }
 
     override fun onCharacteristicReadRequest(
@@ -701,6 +748,16 @@ class ExpoBlePeripheralModule : Module() {
         gattServer?.sendResponse(
           device, requestId, status, offset, value
         );
+      }
+
+      if (!preparedWrite) {
+        sendEvent(
+          CHAR_WRITTEN_EVENT_NAME, mapOf(
+            "characteristics" to arrayOf(
+              formatCharacteristic(characteristic)
+            )
+          )
+        )
       }
     }
 
@@ -779,7 +836,16 @@ class ExpoBlePeripheralModule : Module() {
           val char = it.first
           val buffer = it.second
           char.setValue(buffer.toByteArray())
+
+          sendEvent(
+            CHAR_WRITTEN_EVENT_NAME, mapOf(
+              "characteristics" to arrayOf(
+                formatCharacteristic(char)
+              )
+            )
+          )
         }
+
         preparedCharacteristicWrites.remove(requestId)
       }
 
@@ -789,6 +855,7 @@ class ExpoBlePeripheralModule : Module() {
           val buffer = it.second
           desc.setValue(buffer.toByteArray())
         }
+
         preparedDescriptorWrites.remove(requestId)
       }
     }

@@ -110,16 +110,7 @@ public class ExpoBlePeripheralModule: Module {
           "uuid": uuid,
           "isPrimary": service.isPrimary,
           "characteristics": (service.characteristics ?? []).map({ (char: CBCharacteristic) in
-            let char = char as! CBMutableCharacteristic
-            var c = [
-              "uuid": char.uuid.uuidString,
-              "properties": char.properties.rawValue,
-              "permissions": char.permissions.rawValue
-            ]
-            if let value = char.value {
-              c["value"] = value
-            }
-            return c
+            formatCharacteristic(char as! CBMutableCharacteristic)
           })
         ])
       }
@@ -200,8 +191,30 @@ public class ExpoBlePeripheralModule: Module {
       return manager?.updateValue(args.value, for: characteristic, onSubscribedCentrals: nil) ?? true
     }
 
-    AsyncFunction("start") { (args: Dictionary<String, Any?>, promise: Promise) in
-      if (managerDelegate.startPromise != nil) {
+    AsyncFunction("start") { (promise: Promise) in
+      if (manager != nil) {
+        promise.reject(GenericException("Already started"))
+        return
+      }
+      manager = CBPeripheralManager(delegate: managerDelegate, queue: nil)
+      state = getState()
+      for (_, service) in servicesMap {
+        manager?.add(service)
+      }
+      promise.resolve()
+    }
+
+    AsyncFunction("stop") { (promise: Promise) in
+      if (manager?.isAdvertising == true) {
+        promise.reject(GenericException("stopAdvertising must be called before stopping"))
+        return
+      }
+      manager = nil
+      promise.resolve()
+    }
+
+    AsyncFunction("startAdvertising") { (args: Dictionary<String, Any?>, promise: Promise) in
+      if (managerDelegate.startAdvertisingPromise != nil) {
         promise.reject(GenericException("Starting in progress"))
         return
       }
@@ -211,9 +224,6 @@ public class ExpoBlePeripheralModule: Module {
         return
       }
 
-      manager = CBPeripheralManager(delegate: managerDelegate, queue: nil)
-      state = getState()
-
       if (manager?.isAdvertising ?? false) {
         promise.reject(GenericException("Peripheral is currently advertising"))
         return
@@ -222,8 +232,6 @@ public class ExpoBlePeripheralModule: Module {
       var serviceUuids = [CBUUID]()
       for (_, service) in servicesMap {
         serviceUuids.append(service.uuid)
-
-        manager?.add(service)
       }
 
       let advertisementData = [
@@ -231,13 +239,12 @@ public class ExpoBlePeripheralModule: Module {
         CBAdvertisementDataServiceUUIDsKey: serviceUuids,
       ] as [String: Any]
 
-      managerDelegate.startPromise = promise
+      managerDelegate.startAdvertisingPromise = promise
       manager?.startAdvertising(advertisementData)
     }
 
-    AsyncFunction("stop") { (promise: Promise) in
+    AsyncFunction("stopAdvertising") { (promise: Promise) in
       manager?.stopAdvertising()
-      manager = nil
       promise.resolve()
     }
 
@@ -291,7 +298,7 @@ public class ExpoBlePeripheralModule: Module {
       "uuid": char.uuid.uuidString,
       "properties": char.properties.rawValue,
       "permissions": char.permissions.rawValue
-    ] as [String : Any]
+    ] as [String: Any]
     if let value = char.value {
       c["value"] = value
     }
@@ -302,7 +309,7 @@ public class ExpoBlePeripheralModule: Module {
 class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate {
   private weak var module: ExpoBlePeripheralModule?
 
-  var startPromise: Promise?
+  var startAdvertisingPromise: Promise?
 
   init(module: ExpoBlePeripheralModule) {
     self.module = module
@@ -330,11 +337,11 @@ class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate {
   func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: (any Error)?) {
     if let error = error {
       print("didStartAdvertising: \(error)")
-      startPromise?.reject(error)
+      startAdvertisingPromise?.reject(error)
     } else {
-      startPromise?.resolve()
+      startAdvertisingPromise?.resolve()
     }
-    startPromise = nil
+    startAdvertisingPromise = nil
   }
 
   func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: (any Error)?) {

@@ -205,6 +205,10 @@ class ExpoBlePeripheralModule : Module() {
       state
     }
 
+    Property("isStarted") {
+      gattServer != null
+    }
+
     Property("isAdvertising") {
       isAdvertising
     }

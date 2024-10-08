@@ -98,6 +98,10 @@ public class ExpoBlePeripheralModule: Module {
     Property("state") {
       state
     }
+    
+    Property("isStarted") {
+      manager != nil
+    }
 
     Property("isAdvertising") {
       manager?.isAdvertising ?? false
@@ -355,6 +359,7 @@ class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate {
   func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
     let char = characteristic as! CBMutableCharacteristic
     print("central \(central) didSubscribeTo \(char)")
+    // TODO
   }
 
   func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
